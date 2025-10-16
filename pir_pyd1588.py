@@ -143,7 +143,7 @@ class PYD1588:
     def _reconfigure(self, config: Dict[int, gpiod.LineSettings]) -> None:
         assert self._req is not None, "Lines not requested"
         self._req.reconfigure_lines({
-            self.dl: _ls(
+            self.dl: self._ls(
                 gpiod.line.Direction.INPUT,
                 bias=gpiod.line.Bias.PULL_DOWN,
                 edge=gpiod.line.Edge.RISING
@@ -155,8 +155,8 @@ class PYD1588:
     def write_config(self, cfg25: int) -> None:
         """Send 25-bit configuration word over SERIN. Keeps DL low during send."""
         self._request_lines({
-            self.dl: _ls(gpiod.line.Direction.OUTPUT, value=gpiod.line.Value.INACTIVE),
-            self.serin: _ls(gpiod.line.Direction.OUTPUT, value=gpiod.line.Value.INACTIVE),
+            self.dl: self._ls(gpiod.line.Direction.OUTPUT, value=gpiod.line.Value.INACTIVE),
+            self.serin: self._ls(gpiod.line.Direction.OUTPUT, value=gpiod.line.Value.INACTIVE),
         })
         # Send MSB first
         for bit in range(24, -1, -1):
