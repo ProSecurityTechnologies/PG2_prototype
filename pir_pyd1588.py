@@ -2,7 +2,7 @@
 """
 PYD1588 driver for Raspberry Pi 5 / CM5 using libgpiod (Python v2 bindings: "gpiod").
 Implements configuration via SERIN and Wake-Up (interrupt) mode on DL.
-Raw forced readout is not implemented due to <22 µs timing that is unreliable from userspace.
+Adds best-effort raw 40-bit forced readout (timing-critical; may jitter in Python).
 """
 
 from __future__ import annotations
@@ -56,10 +56,10 @@ def find_default_gpiochip(preferred: str = "/dev/gpiochip4") -> str:
 # ---------- Config register builder ----------
 
 def make_config(
-    threshold: int = 5,
-    blind: int = 1,
-    pulses: int = 0,
-    wtime: int = 3,
+    threshold: int = 20,
+    blind: int = 3,
+    pulses: int = 1,
+    wtime: int = 1,
     opmode: int = 2,
     countmode: int = 0,
     source: int = 0,
@@ -222,7 +222,7 @@ class PYD1588:
         """
         assert self._req is not None, "Call arm_wakeup() first"
         timeout_ms = None if timeout_s is None else int(timeout_s * 1000)
-        evt = self._req.read_edge_events(self.dl)
+        evt = self._req.read_edge_event(self.dl, timeout=timeout_ms)
         return evt is not None
 
     def clear_interrupt(self) -> None:
@@ -247,9 +247,72 @@ class PYD1588:
             )
         })
 
-    def forced_read(self):
-        raise NotImplementedError(
-            "Forced/interrupt readout requires <22 µs bit timing on DL, which is "
-            "not reliable from userspace Python on Pi 5. Use Wake-Up mode or an "
-            "external microcontroller for raw data."
-        )
+    # --- RAW 40-bit read (best-effort, userspace timing) ---
+
+    def _dl_output_low(self):
+        self._reconfigure({
+            self.dl: self._ls(gpiod.line.Direction.OUTPUT, value=gpiod.line.Value.INACTIVE)
+        })
+        self._set_value_enum(self.dl, False)
+
+    def _dl_input_rising(self):
+        self._reconfigure({
+            self.dl: self._ls(
+                gpiod.line.Direction.INPUT,
+                bias=gpiod.line.Bias.PULL_DOWN,
+                edge=gpiod.line.Edge.RISING
+            )
+        })
+
+    def forced_read_packet(self):
+        """
+        Perform a single forced readout and return (oor:int, adc:int, cfg:int).
+        Timing (datasheet):
+          - Start: DL high >=120us, then low
+          - 40 bits MSB-first, each bit must complete in <22us
+          - Terminate with DL low >=1.25ms to update regs
+        """
+        assert self._req is not None, "Call write_config() first (we need SERIN/DL requested)"
+
+        # 1) Start condition: DL HIGH >=120 us, then LOW
+        self._reconfigure({
+            self.dl: self._ls(gpiod.line.Direction.OUTPUT, value=gpiod.line.Value.INACTIVE)
+        })
+        self._set_value_enum(self.dl, True)
+        busy_wait_us(130)               # >=120 us
+        self._set_value_enum(self.dl, False)
+
+        # 2) Read 40 bits with host 'clock' edges on DL:
+        #    For each bit:
+        #      - Drive HIGH briefly (edge), then immediately release to INPUT
+        #      - Sample after ~7–8 us (within 22 us window)
+        #      - Drive LOW briefly to prep next bit
+        bits = 0
+        for _ in range(40):
+            # Rising edge
+            self._reconfigure({ self.dl: self._ls(gpiod.line.Direction.OUTPUT) })
+            self._set_value_enum(self.dl, True)
+            # Release so sensor can drive level
+            self._dl_input_rising()  # input, pulldown (edge setting OK; we won't wait)
+            busy_wait_us(8)          # settle point for sampling
+            v = self._req.get_value(self.dl)
+            bits = (bits << 1) | (1 if v == gpiod.line.Value.ACTIVE else 0)
+            # Prep next bit with a short low
+            self._dl_output_low()
+            busy_wait_us(8)          # keep the whole bit <22us
+
+        # 3) Termination: DL low >= 1.25 ms for register update
+        self._dl_output_low()
+        busy_wait_us(1300)
+        self._dl_input_rising()  # leave as input
+
+        # Parse: [39]=OOR, [38:25]=14-bit ADC, [24:0]=config mirror
+        oor = (bits >> 39) & 0x1
+        adc = (bits >> 25) & 0x3FFF
+        cfg = bits & 0x1FFFFFF
+
+        # If source=BPF, ADC is signed 14-bit (−8192..+8191)
+        if adc & 0x2000:  # sign bit
+            adc -= 0x4000
+
+        return oor, adc, cfg
