@@ -18,7 +18,7 @@ def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument("--chip", default="/dev/gpiochip4", help="gpiochip path (auto-detect if omitted)")
     p.add_argument("--dl", type=int, default=17, help="GPIO number for DL (default 17)")
-    p.add_argument("--serin", type=int, default=10, help="GPIO number for SERIN (default 10)")
+    p.add_argument("--serin", type=int, default=27, help="GPIO number for SERIN (default 10)")
     p.add_argument("--threshold", type=int, default=20, help="Motion threshold (0..255)")
     p.add_argument("--blind", type=int, default=3, help="Blind time steps (0..15)")
     p.add_argument("--pulses", type=int, default=1, help="Pulse counter (0..3) -> needs N+1 pulses")
