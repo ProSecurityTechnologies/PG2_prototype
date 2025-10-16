@@ -3,6 +3,7 @@ import asyncio, json, os, sys, time, signal, platform, socket
 from pathlib import Path
 from dataclasses import dataclass, asdict
 import gpiod  # sudo apt install python3-libgpiod
+from pir_pyd1588 import PYD1588, make_config
 
 # ========= Session + timebase =========
 
@@ -158,36 +159,76 @@ async def run_camera(queue: asyncio.Queue, raw_path: Path, cfg: dict):
                 proc.terminate()
             await proc.wait()
 
-async def run_pir(queue: asyncio.Queue, chip_path: str, line_offset: int):
+async def run_pir_pyd1588(queue, *,
+                          gpiochip: str = "/dev/gpiochip0",
+                          dl: int = 17,
+                          serin: int = 27,
+                          cfg: dict | None = None,
+                          include_raw_adc: bool = False):
     """
-    PIR via libgpiod edge events. Emits rising/falling with both mono+wall timestamps.
+    Uses your PYD1588 driver exactly as implemented:
+      - set lines, write config via SERIN
+      - arm wake-up on DL
+      - wait_for_motion() with short timeouts so we can be cancellable
+      - clear_interrupt() after each fire
+      - optionally do a best-effort forced 40-bit raw read to get ADC amplitude
     """
-    chip = gpiod.Chip(chip_path)
-    line = chip.get_line(line_offset)
-    line.request(consumer="pir", type=gpiod.LINE_REQ_EV_BOTH_EDGES)
+    sensor = PYD1588()
+    sensor.gpiochip = gpiochip
+    sensor.dl = dl
+    sensor.serin = serin
+
+    # Default config close to your prior examples; adjust as you like
+    # threshold, blind, pulses, wtime, opmode=2 (Wake-Up), countmode, source=0(BPF)
+    cfg = cfg or dict(threshold=20, blind=3, pulses=1, wtime=1, opmode=2, countmode=0, source=0)
+
+    # Push SERIN config and arm wake-up on DL
+    sensor.write_config(make_config(**cfg))
+    sensor.arm_wakeup()
+
     seq = 0
+    loop = asyncio.get_running_loop()
     try:
         while True:
-            # Wait up to 10s; loop continues if nothing
-            if not line.event_wait(sec=10):
+            # Run blocking call in a thread so asyncio remains responsive
+            fired = await loop.run_in_executor(None, sensor.wait_for_motion, 1.0)
+            if not fired:
                 continue
-            e = line.event_read()  # Note: some libgpiod builds include kernel ts; we use monotonic for consistency
+
             ts = now_mono()
-            edge = "rising" if e.type == gpiod.LineEvent.RISING_EDGE else "falling"
+            payload = {}
+            if include_raw_adc:
+                try:
+                    oor, adc, cfg_mirror = sensor.forced_read_packet()
+                    payload.update({"adc": int(adc), "oor": bool(oor), "cfg_mirror": int(cfg_mirror)})
+                except Exception as e:
+                    # Raw read is best-effort; don't break the pipeline
+                    payload.update({"adc_read_error": str(e)})
+
             await queue.put({
                 "ts_mono_ns": ts,
                 "ts_wall_ns": wall_from_mono(ts),
                 "source": "pir",
                 "seq": seq,
-                "meta": {"edge": edge, "line": line_offset, "chip": chip_path},
-                "payload": {}
+                "meta": {
+                    "edge": "rising",             # DL rising woke us up
+                    "chip": gpiochip,
+                    "line": dl,
+                    "serin": serin,
+                    "driver": "PYD1588",
+                    "config": cfg
+                },
+                "payload": payload
             })
             seq += 1
+
+            # Acknowledge event on the sensor and re-arm
+            sensor.clear_interrupt()
+    except asyncio.CancelledError:
+        pass
     finally:
-        try: line.release()
-        except: pass
-        try: chip.close()
-        except: pass
+        sensor.close()
+
 
 async def run_csi_placeholder(queue: asyncio.Queue, cfg: dict):
     """
@@ -233,7 +274,7 @@ async def main():
     # Configs (tweak as needed)
     audio_cfg = {"device": "hw:1,0", "rate": 48000, "chunk_ms": 100}
     video_cfg = {"width": 1280, "height": 720}
-    pir_cfg = {"chip": "/dev/gpiochip0", "line": 23}
+    pir_cfg = {"chip": "/dev/gpiochip4", "line": 23}
     csi_cfg = {}
 
     # Files
@@ -274,7 +315,14 @@ async def main():
         asyncio.create_task(event_writer(q, events_jsonl)),
         asyncio.create_task(run_camera(q, video_raw, video_cfg)),
         asyncio.create_task(run_audio(q, audio_raw, audio_cfg)),
-        asyncio.create_task(run_pir(q, pir_cfg["chip"], pir_cfg["line"])),
+        asyncio.create_task(run_pir_pyd1588(
+            q,
+            gpiochip="/dev/gpiochip0",
+            dl=23,          # <- your DL line
+            serin=17,       # <- your SERIN (MOSI) line
+            cfg=dict(threshold=20, blind=3, pulses=1, wtime=1, opmode=2, countmode=0, source=0),
+            include_raw_adc=True   # set False if you don’t want the extra read
+        )),
         asyncio.create_task(run_csi_placeholder(q, csi_cfg)),
     ]
 
