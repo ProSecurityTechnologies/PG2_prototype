@@ -1,9 +1,8 @@
 # pir_pyd1588.py
 """
 PYD1588 driver for Raspberry Pi 5 / CM5 using libgpiod (Python v2 bindings: "gpiod").
-Covers configuration via SERIN and Wake-Up (interrupt) mode on DL.
-Raw forced readout (40-bit) is intentionally not implemented due to tight <22 µs timing
-that is unreliable from userspace without DMA.
+Implements configuration via SERIN and Wake-Up (interrupt) mode on DL.
+Raw forced readout is not implemented due to <22 µs timing that is unreliable from userspace.
 """
 
 from __future__ import annotations
@@ -31,11 +30,10 @@ def busy_wait_us(us: int) -> None:
 def find_default_gpiochip(preferred: str = "/dev/gpiochip4") -> str:
     """
     Return a likely gpiochip path for the 40-pin header on Pi 5/CM5.
-    Defaults to /dev/gpiochip4 if present, otherwise falls back to the first
-    chip that can successfully request line 17.
+    Defaults to /dev/gpiochip4 if present; otherwise probes chips for line 17.
     """
     try:
-        with gpiod.Chip(preferred) as _:
+        with gpiod.Chip(preferred):
             return preferred
     except Exception:
         pass
@@ -52,7 +50,6 @@ def find_default_gpiochip(preferred: str = "/dev/gpiochip4") -> str:
                 return path
         except Exception:
             continue
-
     return "/dev/gpiochip0"
 
 
@@ -149,6 +146,11 @@ class PYD1588:
         assert self._req is not None, "Lines not requested"
         self._req.reconfigure_lines(config)
 
+    def _set_value_enum(self, offset: int, active: bool) -> None:
+        """Always set with the v2 enum (no raw ints)."""
+        assert self._req is not None
+        self._req.set_value(offset, gpiod.line.Value.ACTIVE if active else gpiod.line.Value.INACTIVE)
+
     # ----- lifecycle -----
 
     def close(self) -> None:
@@ -176,13 +178,13 @@ class PYD1588:
         for bit in range(24, -1, -1):
             b = (cfg25 >> bit) & 1
             # Rising edge, then present data level and hold >= 80 µs
-            self._req.set_value(self.serin, 0)
-            self._req.set_value(self.serin, 1)
-            self._req.set_value(self.serin, b)
+            self._set_value_enum(self.serin, False)  # 0
+            self._set_value_enum(self.serin, True)   # 1 (edge)
+            self._set_value_enum(self.serin, bool(b))
             busy_wait_us(self.T_SHD)
 
         # Latch with low gap > 650 µs
-        self._req.set_value(self.serin, 0)
+        self._set_value_enum(self.serin, False)
         busy_wait_us(self.T_SLT)
 
         # Settle
@@ -233,8 +235,7 @@ class PYD1588:
         self._reconfigure({
             self.dl: self._ls(gpiod.line.Direction.OUTPUT, value=gpiod.line.Value.INACTIVE)
         })
-        # For reconfiguration we already set the output value, but set again to be explicit:
-        self._req.set_value(self.dl, 0)
+        self._set_value_enum(self.dl, False)
         busy_wait_us(self.T_INTCLR)
 
         # Re-arm rising edge detection with pulldown
