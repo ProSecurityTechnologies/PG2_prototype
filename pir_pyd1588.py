@@ -56,10 +56,10 @@ def find_default_gpiochip(preferred: str = "/dev/gpiochip4") -> str:
 # ---------- Config register builder ----------
 
 def make_config(
-    threshold: int = 20,
-    blind: int = 3,
-    pulses: int = 1,
-    wtime: int = 1,
+    threshold: int = 5,
+    blind: int = 1,
+    pulses: int = 0,
+    wtime: int = 3,
     opmode: int = 2,
     countmode: int = 0,
     source: int = 0,

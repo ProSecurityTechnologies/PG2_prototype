@@ -16,7 +16,7 @@ from pir_pyd1588 import PYD1588, make_config
 
 def parse_args():
     p = argparse.ArgumentParser()
-    p.add_argument("--chip", default=None, help="gpiochip path (auto-detect if omitted)")
+    p.add_argument("--chip", default="/dev/gpiochip4", help="gpiochip path (auto-detect if omitted)")
     p.add_argument("--dl", type=int, default=17, help="GPIO number for DL (default 17)")
     p.add_argument("--serin", type=int, default=10, help="GPIO number for SERIN (default 10)")
     p.add_argument("--threshold", type=int, default=20, help="Motion threshold (0..255)")
@@ -42,10 +42,12 @@ def main():
 
         sensor.write_config(cfg)
         sensor.arm_wakeup()
+        sensor.clear_interrupt()
         print("PYD1588 armed (Wake-Up). Move in front of the sensor... Ctrl+C to stop.")
 
         while True:
-            fired = sensor.wait_for_motion(timeout_s=10.0)
+            fired = sensor.wait_for_motion(timeout_s=0.5)
+            # lvl = sensor._req.get_value(sensor.dl)
             if fired:
                 ts = time.strftime("%Y-%m-%d %H:%M:%S")
                 print(f"[{ts}] MOTION")
