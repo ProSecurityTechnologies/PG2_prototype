@@ -46,7 +46,7 @@ def find_default_gpiochip(preferred: str = "/dev/gpiochip4") -> str:
                 # v2: lines are by offset; Pi GPIO17 offset==17 on the header chip
                 # We'll just try to request it exclusively to test availability.
                 cfg = {
-                    17: gpiod.LineSettings(direction=gpiod.LineDirection.INPUT)
+                    17: gpiod.LineSettings(direction=gpiod.line.Direction.INPUT)
                 }
                 req = chip.request_lines(consumer="pyd1588-probe", config=cfg)
                 req.release()
@@ -135,9 +135,9 @@ class PYD1588:
     def write_config(self, cfg25: int) -> None:
         """Send 25-bit configuration word over SERIN. Keeps DL low during send."""
         self._request_lines({
-            self.dl: gpiod.LineSettings(direction=gpiod.LineDirection.OUTPUT,
+            self.dl: gpiod.LineSettings(direction=gpiod.line.Direction.OUTPUT,
                                         output_value=0),
-            self.serin: gpiod.LineSettings(direction=gpiod.LineDirection.OUTPUT,
+            self.serin: gpiod.LineSettings(direction=gpiod.line.Direction.OUTPUT,
                                            output_value=0),
         })
         # Send MSB first
@@ -158,17 +158,17 @@ class PYD1588:
         """Configure DL for rising-edge interrupt detection (Wake-Up mode)."""
         if self._req is None:
             self._request_lines({
-                self.dl: gpiod.LineSettings(direction=gpiod.LineDirection.INPUT,
-                                            bias=gpiod.LineBias.PULL_DOWN,
-                                            edge_detection=gpiod.LineEdge.RISING),
-                self.serin: gpiod.LineSettings(direction=gpiod.LineDirection.OUTPUT,
+                self.dl: gpiod.LineSettings(direction=gpiod.line.Direction.INPUT,
+                                            bias=gpiod.line.Bias.PULL_DOWN,
+                                            edge_detection=gpiod.line.Edge.RISING),
+                self.serin: gpiod.LineSettings(direction=gpiod.line.Direction.OUTPUT,
                                                output_value=0),
             })
         else:
             self._reconfigure({
-                self.dl: gpiod.LineSettings(direction=gpiod.LineDirection.INPUT,
-                                            bias=gpiod.LineBias.PULL_DOWN,
-                                            edge_detection=gpiod.LineEdge.RISING),
+                self.dl: gpiod.LineSettings(direction=gpiod.line.Direction.INPUT,
+                                            bias=gpiod.line.Bias.PULL_DOWN,
+                                            edge_detection=gpiod.line.Edge.RISING),
             })
 
     def wait_for_motion(self, timeout_s: Optional[float] = None) -> bool:
@@ -183,15 +183,15 @@ class PYD1588:
         assert self._req is not None, "arm_wakeup() must be called first"
         # Temporarily drive DL low
         self._reconfigure({
-            self.dl: gpiod.LineSettings(direction=gpiod.LineDirection.OUTPUT)
+            self.dl: gpiod.LineSettings(direction=gpiod.line.Direction.OUTPUT)
         })
         self._req.set_value(self.dl, 0)
         busy_wait_us(self.T_INTCLR)
         # Re-arm
         self._reconfigure({
-            self.dl: gpiod.LineSettings(direction=gpiod.LineDirection.INPUT,
-                                        bias=gpiod.LineBias.PULL_DOWN,
-                                        edge_detection=gpiod.LineEdge.RISING)
+            self.dl: gpiod.LineSettings(direction=gpiod.line.Direction.INPUT,
+                                        bias=gpiod.line.Bias.PULL_DOWN,
+                                        edge_detection=gpiod.line.Edge.RISING)
         })
 
     # Optional placeholder for raw readout
