@@ -1,118 +1,203 @@
-import pigpio
+
+"""
+PYD1588 driver for Raspberry Pi 5 / CM5 using libgpiod (Python v2 bindings: "gpiod").
+Covers configuration via SERIN and Wake-Up (interrupt) mode on DL.
+Raw forced readout (40-bit) is intentionally not implemented due to tight <22us timing
+that is unreliable from userspace without DMA.
+"""
+
+from __future__ import annotations
 import time
+from dataclasses import dataclass
+from typing import Optional, Dict
 
-class PYD1588:
-    # Protocol timings (microseconds), per datasheet
-    T_SHD = 80        # SERIN data hold >= 80 us
-    T_SLT = 700       # SERIN latch low time > 650 us
-    T_DS  = 130       # Forced read start: DL high >=120 us
-    T_UP  = 1300      # DL low after packet to update regs >1250 us
-    T_BIT = 18        # DL bit period <22 us (host toggling cadence)
-    T_INTCLR = 200    # Clear interrupt: pull DL low >=160 us
+try:
+    import gpiod  # v2 API (pip install gpiod)
+    _GPIOD_V2 = True
+except Exception as e:
+    raise RuntimeError(
+        "This driver requires the libgpiod v2 Python package 'gpiod'.\n"
+        "Install with:  python3 -m pip install --upgrade gpiod"
+    ) from e
 
-    def __init__(self, pi, gpio_dl=17, gpio_serin=27):
-        self.pi = pi
-        self.gpio_dl = gpio_dl
-        self.gpio_serin = gpio_serin
+# ---------- Helpers ----------
 
-        # Setup pins
-        self.pi.set_mode(self.gpio_dl, pigpio.OUTPUT)     # We'll switch modes dynamically
-        self.pi.set_pull_up_down(self.gpio_dl, pigpio.PUD_OFF)
-        self.pi.write(self.gpio_dl, 0)                    # DL idle low
+def busy_wait_us(us: int) -> None:
+    target = time.monotonic_ns() + int(us * 1000)
+    while time.monotonic_ns() < target:
+        pass
 
-        self.pi.set_mode(self.gpio_serin, pigpio.OUTPUT)
-        self.pi.set_pull_up_down(self.gpio_serin, pigpio.PUD_OFF)
-        self.pi.write(self.gpio_serin, 0)
+def find_default_gpiochip(preferred: str = "/dev/gpiochip4") -> str:
+    """Return a likely gpiochip path for the 40-pin header on Pi 5/CM5.
+    Defaults to /dev/gpiochip4 if present, otherwise falls back to the first
+    chip that exposes line 17 (GPIO17)."""
+    try:
+        # Fast path
+        with gpiod.Chip(preferred) as chip:
+            return preferred
+    except Exception:
+        pass
 
-    # --- SERIN: send 25-bit config word MSB first ---
-    def write_config(self, cfg25):
-        # During configuration, DL must be kept LOW by host
-        self.pi.set_mode(self.gpio_dl, pigpio.OUTPUT)
-        self.pi.write(self.gpio_dl, 0)
-
-        for bit in range(24, -1, -1):  # 25 bits: [24..0]
-            b = (cfg25 >> bit) & 1
-            # low->high edge, then hold data level >=80us
-            self.pi.write(self.gpio_serin, 0)
-            # very short tSL allowed, 1 instruction is fine; ensure an edge
-            self.pi.write(self.gpio_serin, 1)  # rising edge clocks data
-            self.pi.write(self.gpio_serin, b)  # apply data level
-            time.sleep(self.T_SHD / 1_000_000.0)
-
-        # Latch by keeping SERIN low gap >650us
-        self.pi.write(self.gpio_serin, 0)
-        time.sleep(self.T_SLT / 1_000_000.0)
-        # Datasheet: config available for readback after ~2.4ms
-        time.sleep(0.003)
-
-    # --- Wake-Up mode helper: wait for rising edge on DL, then clear ---
-    def wait_for_motion(self, timeout_s=None):
-        # DL must be input (Hi-Z) so sensor can drive it
-        self.pi.set_mode(self.gpio_dl, pigpio.INPUT)
-        self.pi.set_pull_up_down(self.gpio_dl, pigpio.PUD_DOWN)
-
-        cb = self.pi.callback(self.gpio_dl, pigpio.RISING_EDGE)
-        start = time.time()
-        fired = False
+    # Fallback: scan chips and look for a chip with line 17 present
+    for chipnum in range(0, 8):
+        path = f"/dev/gpiochip{chipnum}"
         try:
-            while True:
-                if cb.tally() > 0:
-                    fired = True
-                    break
-                if timeout_s is not None and (time.time() - start) >= timeout_s:
-                    break
-                time.sleep(0.001)
+            with gpiod.Chip(path) as chip:
+                # v2: lines are by offset; Pi GPIO17 offset==17 on the header chip
+                # We'll just try to request it exclusively to test availability.
+                cfg = {
+                    17: gpiod.LineSettings(direction=gpiod.LineDirection.INPUT)
+                }
+                req = chip.request_lines(consumer="pyd1588-probe", config=cfg)
+                req.release()
+                return path
+        except Exception:
+            continue
+    # Last resort
+    return "/dev/gpiochip0"
+
+# ---------- Config register builder ----------
+
+def make_config(threshold: int = 20, blind: int = 3, pulses: int = 1, wtime: int = 1,
+                opmode: int = 2, countmode: int = 0, source: int = 0) -> int:
+    """Build the 25-bit configuration word (MSB..LSB).
+    Field layout:
+      [24:17] Threshold (8b)
+      [16:13] BlindTime (4b)
+      [12:11] PulseCounter (2b)
+      [10:9]  WindowTime (2b)
+      [8:7]   OpMode (2b)   0=Forced 1=Int-Readout 2=Wake-Up (3=reserved)
+      [6]     CountMode (1b)
+      [5:4]   FilterSource (2b) 0=BPF 1=LPF 2/3=vendor-defined
+      [3:0]   reserved
+    """
+    cfg = 0
+    cfg |= (threshold & 0xFF) << 17
+    cfg |= (blind     & 0x0F) << 13
+    cfg |= (pulses    & 0x03) << 11
+    cfg |= (wtime     & 0x03) << 9
+    cfg |= (opmode    & 0x03) << 7
+    cfg |= (countmode & 0x01) << 6
+    cfg |= (source    & 0x03) << 4
+    return cfg
+
+# ---------- Driver ----------
+
+@dataclass
+class PYD1588:
+    """Driver for PYD1588 using libgpiod v2.
+    SERIN: output-only (config)
+    DL:    input (interrupt) most of the time; briefly output-low to clear interrupt.
+    """
+    gpiochip: Optional[str] = None
+    dl: int = 17
+    serin: int = 27
+    _chip: Optional[gpiod.Chip] = None
+    _req: Optional[gpiod.Request] = None
+
+    # Timing constants (microseconds) based on datasheet
+    T_SHD = 80       # SERIN data hold >= 80 us
+    T_SLT = 700      # SERIN latch low time > 650 us
+    T_INTCLR = 200   # Clear interrupt: DL low >= 160 us
+    # Datasheet suggests ~2.4ms until config available for readback
+    T_CFG_SETTLE_MS = 3
+
+    def _ensure_chip(self) -> None:
+        if self._chip is not None:
+            return
+        path = self.gpiochip or find_default_gpiochip()
+        self._chip = gpiod.Chip(path)
+
+    def close(self) -> None:
+        try:
+            if self._req is not None:
+                self._req.release()
         finally:
-            cb.cancel()
+            self._req = None
+            if self._chip is not None:
+                self._chip.close()
+            self._chip = None
 
-        if not fired:
-            return False
+    # --- Low-level line (re)configuration ---
 
-        # Clear the interrupt: DL must be driven LOW >=160us
-        self.pi.set_mode(self.gpio_dl, pigpio.OUTPUT)
-        self.pi.write(self.gpio_dl, 0)
-        time.sleep(self.T_INTCLR / 1_000_000.0)
-        # Release (Hi-Z) again
-        self.pi.set_mode(self.gpio_dl, pigpio.INPUT)
-        self.pi.set_pull_up_down(self.gpio_dl, pigpio.PUD_DOWN)
-        return True
+    def _request_lines(self, config: Dict[int, gpiod.LineSettings]) -> None:
+        self._ensure_chip()
+        if self._req is not None:
+            self._req.release()
+        self._req = self._chip.request_lines(consumer="pyd1588", config=config)
 
-    # --- Forced read: read 40-bit packet from DL ---
+    def _reconfigure(self, config: Dict[int, gpiod.LineSettings]) -> None:
+        assert self._req is not None, "Lines not requested"
+        self._req.reconfigure_lines(config)
+
+    # --- Public API ---
+
+    def write_config(self, cfg25: int) -> None:
+        """Send 25-bit configuration word over SERIN. Keeps DL low during send."""
+        self._request_lines({
+            self.dl: gpiod.LineSettings(direction=gpiod.LineDirection.OUTPUT,
+                                        output_value=0),
+            self.serin: gpiod.LineSettings(direction=gpiod.LineDirection.OUTPUT,
+                                           output_value=0),
+        })
+        # Send MSB first
+        for bit in range(24, -1, -1):
+            b = (cfg25 >> bit) & 1
+            # Rising edge, then present data level and hold >= 80us
+            self._req.set_value(self.serin, 0)
+            self._req.set_value(self.serin, 1)
+            self._req.set_value(self.serin, b)
+            busy_wait_us(self.T_SHD)
+        # Latch with low gap > 650us
+        self._req.set_value(self.serin, 0)
+        busy_wait_us(self.T_SLT)
+        # Settle
+        time.sleep(self.T_CFG_SETTLE_MS / 1000.0)
+
+    def arm_wakeup(self) -> None:
+        """Configure DL for rising-edge interrupt detection (Wake-Up mode)."""
+        if self._req is None:
+            self._request_lines({
+                self.dl: gpiod.LineSettings(direction=gpiod.LineDirection.INPUT,
+                                            bias=gpiod.LineBias.PULL_DOWN,
+                                            edge_detection=gpiod.LineEdge.RISING),
+                self.serin: gpiod.LineSettings(direction=gpiod.LineDirection.OUTPUT,
+                                               output_value=0),
+            })
+        else:
+            self._reconfigure({
+                self.dl: gpiod.LineSettings(direction=gpiod.LineDirection.INPUT,
+                                            bias=gpiod.LineBias.PULL_DOWN,
+                                            edge_detection=gpiod.LineEdge.RISING),
+            })
+
+    def wait_for_motion(self, timeout_s: Optional[float] = None) -> bool:
+        """Block until a motion event occurs or timeout elapses. Returns True if fired."""
+        assert self._req is not None, "Call arm_wakeup() first"
+        timeout_ms = None if timeout_s is None else int(timeout_s * 1000)
+        evt = self._req.read_edge_event(self.dl, timeout=timeout_ms)
+        return evt is not None
+
+    def clear_interrupt(self) -> None:
+        """Drive DL low >= 160 us to clear Wake-Up interrupt, then re-arm input."""
+        assert self._req is not None, "arm_wakeup() must be called first"
+        # Temporarily drive DL low
+        self._reconfigure({
+            self.dl: gpiod.LineSettings(direction=gpiod.LineDirection.OUTPUT)
+        })
+        self._req.set_value(self.dl, 0)
+        busy_wait_us(self.T_INTCLR)
+        # Re-arm
+        self._reconfigure({
+            self.dl: gpiod.LineSettings(direction=gpiod.LineDirection.INPUT,
+                                        bias=gpiod.LineBias.PULL_DOWN,
+                                        edge_detection=gpiod.LineEdge.RISING)
+        })
+
+    # Optional placeholder for raw readout
     def forced_read(self):
-        # Start condition: DL high >=120us, then low
-        self.pi.set_mode(self.gpio_dl, pigpio.OUTPUT)
-        self.pi.write(self.gpio_dl, 1)
-        time.sleep(self.T_DS / 1_000_000.0)
-        self.pi.write(self.gpio_dl, 0)
-
-        # Now read bits; host clocks by making a short HI then releasing to input
-        bits = 0
-        for i in range(40):
-            # Host generates LOW->HIGH and releases (input/Hi-Z),
-            # sensor drives 0 (pulls low) or leaves high for 1
-            self.pi.set_mode(self.gpio_dl, pigpio.OUTPUT)
-            self.pi.write(self.gpio_dl, 1)  # rising edge
-            # release to input quickly so sensor can drive level
-            self.pi.set_mode(self.gpio_dl, pigpio.INPUT)
-            # allow settle within <22us window
-            time.sleep(self.T_BIT / 1_000_000.0)
-            val = self.pi.read(self.gpio_dl)
-            bits = (bits << 1) | (1 if val else 0)
-            # Host pulls low to prep next bit. Keep low very briefly (<22us).
-            self.pi.set_mode(self.gpio_dl, pigpio.OUTPUT)
-            self.pi.write(self.gpio_dl, 0)
-            # small low time to avoid exceeding the 22us spec
-            time.sleep(self.T_BIT / 1_000_000.0)
-
-        # Termination: DL low >=1.25ms for register update
-        self.pi.write(self.gpio_dl, 0)
-        time.sleep(self.T_UP / 1_000_000.0)
-        # Release to input again
-        self.pi.set_mode(self.gpio_dl, pigpio.INPUT)
-
-        # Parse packet: [39]=OOR, [38:25]=14-bit ADC, [24:0]=config
-        oor = (bits >> 39) & 0x1
-        adc = (bits >> 25) & 0x3FFF
-        cfg = bits & 0x1FFFFFF
-
-        return oor, adc, cfg
+        raise NotImplementedError(
+            "Forced/interrupt readout requires <22us bit timing on DL, which is "
+            "not reliable from userspace Python without DMA on Pi 5. "
+            "Use Wake-Up mode or an external microcontroller for raw data."
+        )
