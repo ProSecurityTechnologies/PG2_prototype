@@ -222,7 +222,7 @@ class PYD1588:
         """
         assert self._req is not None, "Call arm_wakeup() first"
         timeout_ms = None if timeout_s is None else int(timeout_s * 1000)
-        evt = self._req.read_edge_event(self.dl, timeout=timeout_ms)
+        evt = self._req.read_edge_events(self.dl, timeout=timeout_ms)
         return evt is not None
 
     def clear_interrupt(self) -> None:
