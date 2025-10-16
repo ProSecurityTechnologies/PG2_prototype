@@ -119,26 +119,44 @@ class PYD1588:
             self._chip = None
 
     # --- Low-level line (re)configuration ---
+    def _ls(direction, *, value=None, bias=None, edge=None):
+        # Build a LineSettings with the proper v2 enums
+        s = gpiod.LineSettings(direction=direction)
+        if value is not None:
+            s.output_value = value           # must be a gpiod.line.Value
+        if bias is not None:
+            s.bias = bias                    # must be a gpiod.line.Bias
+        if edge is not None:
+            s.edge_detection = edge          # must be a gpiod.line.Edge
+        return s
 
-    def _request_lines(self, config: Dict[int, gpiod.LineSettings]) -> None:
-        self._ensure_chip()
-        if self._req is not None:
-            self._req.release()
+
+    def _request_lines(self, config):
+        # config must be: { offset:int -> gpiod.LineSettings }
+        # Example:
+        # {
+        #   self.dl:    _ls(gpiod.line.Direction.OUTPUT, value=gpiod.line.Value.INACTIVE),
+        #   self.serin: _ls(gpiod.line.Direction.OUTPUT, value=gpiod.line.Value.INACTIVE),
+        # }
         self._req = self._chip.request_lines(consumer="pyd1588", config=config)
 
     def _reconfigure(self, config: Dict[int, gpiod.LineSettings]) -> None:
         assert self._req is not None, "Lines not requested"
-        self._req.reconfigure_lines(config)
+        self._req.reconfigure_lines({
+            self.dl: _ls(
+                gpiod.line.Direction.INPUT,
+                bias=gpiod.line.Bias.PULL_DOWN,
+                edge=gpiod.line.Edge.RISING
+            )
+        })
 
     # --- Public API ---
 
     def write_config(self, cfg25: int) -> None:
         """Send 25-bit configuration word over SERIN. Keeps DL low during send."""
         self._request_lines({
-            self.dl: gpiod.LineSettings(direction=gpiod.line.Direction.OUTPUT,
-                                        output_value=0),
-            self.serin: gpiod.LineSettings(direction=gpiod.line.Direction.OUTPUT,
-                                           output_value=0),
+            self.dl: _ls(gpiod.line.Direction.OUTPUT, value=gpiod.line.Value.INACTIVE),
+            self.serin: _ls(gpiod.line.Direction.OUTPUT, value=gpiod.line.Value.INACTIVE),
         })
         # Send MSB first
         for bit in range(24, -1, -1):
@@ -162,7 +180,7 @@ class PYD1588:
                                             bias=gpiod.line.Bias.PULL_DOWN,
                                             edge_detection=gpiod.line.Edge.RISING),
                 self.serin: gpiod.LineSettings(direction=gpiod.line.Direction.OUTPUT,
-                                               output_value=0),
+                                               output_value=gpiod.line.Value.LOW),
             })
         else:
             self._reconfigure({
