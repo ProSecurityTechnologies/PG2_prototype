@@ -1,188 +1,189 @@
 #!/usr/bin/env python3
-import asyncio, json, os, sys, time, signal, platform, socket
+# Orchestrator that saves directly in standard formats:
+#   - video.h264 (H.264 from libcamera-vid, inline SPS/PPS)
+#   - audio.wav  (WAV/PCM from arecord)
+#   - events.jsonl (timestamps for camera frames, audio chunks, PIR edges, CSI heartbeat)
+
+import asyncio, json, os, time, signal, socket, platform, argparse, contextlib, re
 from pathlib import Path
-from dataclasses import dataclass, asdict
 import gpiod  # sudo apt install python3-libgpiod
-from pir_pyd1588 import PYD1588, make_config
 
-# ========= Session + timebase =========
-
+# ========= Timebase =========
 offset_ns = time.time_ns() - time.monotonic_ns()
 now_mono = time.monotonic_ns
 def wall_from_mono(ts_mono_ns: int) -> int:
     return ts_mono_ns + offset_ns
 
-@dataclass
-class SessionMeta:
-    session_id: str
-    created_wall_ns: int
-    created_iso: str
-    host: str
-    platform: str
-    kernel: str
-    tz: str
-    clock_offset_ns: int
-    video: dict
-    audio: dict
-    pir: dict
-    csi: dict
-
+# ========= Session helpers =========
 def make_session_root(root="dataset") -> Path:
     session_id = time.strftime("%Y%m%d_%H%M%S_session", time.localtime())
     p = Path(root) / session_id
     p.mkdir(parents=True, exist_ok=True)
     return p
 
-# ========= JSONL writer =========
-
 class JsonlWriter:
     def __init__(self, path: Path):
-        self.path = path
-        self.f = open(self.path, "a", buffering=1)
-
+        self.f = open(path, "a", buffering=1)
     def write(self, obj: dict):
         self.f.write(json.dumps(obj, separators=(",", ":")) + "\n")
-
     def close(self):
-        try: self.f.close()
-        except: pass
+        with contextlib.suppress(Exception):
+            self.f.close()
 
 # ========= Producers =========
 
-async def run_audio(queue: asyncio.Queue, raw_path: Path, fmt: dict):
+async def run_audio_wav(queue: asyncio.Queue, out_wav: Path, *, device="plughw:2,0", rate=48000, chunk_ms=100):
     """
-    Read S32_LE mono 48k chunks from arecord and append to file.
-    Log an event per chunk with byte offsets and sequence.
+    Capture WAV/PCM directly from arecord on stdout; we write it to audio.wav and emit an event per ~chunk_ms.
     """
     cmd = [
         "arecord",
-        "-D", fmt.get("device", "hw:2,0"),
+        "-D", device,
         "-c", "1",
-        "-r", str(fmt.get("rate", 16000)),
+        "-r", str(rate),
         "-f", "S16_LE",
-        "-q",
-        "-t", "raw",
-        "-"
+        "-t", "wav",
+        "-"  # stdout
     ]
-    CHUNK_S = fmt.get("chunk_ms", 100) / 1000.0
-    BYTES_PER_SAMPLE = 4
-    CHUNK_BYTES = int(fmt.get("rate", 48000) * CHUNK_S * BYTES_PER_SAMPLE)
+    BYTES_PER_SAMPLE = 2
+    CHUNK_BYTES = int(rate * (chunk_ms/1000.0) * BYTES_PER_SAMPLE)
 
-    proc = await asyncio.create_subprocess_exec(
-        *cmd, stdout=asyncio.subprocess.PIPE
-    )
+    proc = await asyncio.create_subprocess_exec(*cmd, stdout=asyncio.subprocess.PIPE)
     seq = 0
-    buf = b""
     bytes_written = 0
-    with open(raw_path, "ab", buffering=0) as audio_out:
+    buf = b""
+    with open(out_wav, "ab", buffering=0) as wav_out:
         try:
             while True:
-                need = CHUNK_BYTES - len(buf)
-                data = await proc.stdout.read(need if need > 0 else CHUNK_BYTES)
+                # Read in reasonably sized chunks
+                data = await proc.stdout.read(max(CHUNK_BYTES - len(buf), 4096))
                 if not data:
                     break
                 buf += data
-                if len(buf) >= CHUNK_BYTES:
+                # Flush all buffered data to file (we don't need to align writes to CHUNK strictly)
+                wav_out.write(buf)
+                bytes_written += len(buf)
+                # Emit events in ~chunk_ms cadence
+                while len(buf) >= CHUNK_BYTES:
                     ts = now_mono()
-                    audio_out.write(buf[:CHUNK_BYTES])
-                    bytes_written += CHUNK_BYTES
                     await queue.put({
                         "ts_mono_ns": ts,
                         "ts_wall_ns": wall_from_mono(ts),
                         "source": "audio",
                         "seq": seq,
-                        "meta": {
-                            "rate": fmt.get("rate", 48000),
-                            "fmt": "S32_LE",
-                            "chunk_ms": fmt.get("chunk_ms", 100),
-                            "bytes_per_sample": BYTES_PER_SAMPLE,
-                            "device": fmt.get("device", "hw:1,0")
-                        },
-                        "payload": {
-                            "chunk_bytes": CHUNK_BYTES,
-                            "file_bytes_total": bytes_written
-                        }
+                        "meta": {"fmt":"wav","pcm_fmt":"S16_LE","rate":rate,"device":device,"chunk_ms":chunk_ms},
+                        "payload": {"chunk_bytes": CHUNK_BYTES, "file_bytes_total": bytes_written}
                     })
                     buf = buf[CHUNK_BYTES:]
                     seq += 1
+                # keep any residual bytes in buf so cadence remains stable
         finally:
             with contextlib.suppress(ProcessLookupError):
                 proc.terminate()
-            await proc.wait()
+            with contextlib.suppress(Exception):
+                await proc.wait()
 
-async def run_camera(queue: asyncio.Queue, raw_path: Path, cfg: dict):
+async def run_camera_h264_with_pts(queue: asyncio.Queue, out_h264: Path, pts_path: Path, *, w=1280, h=720, fps=30):
     """
-    Stream YUV420 frames from libcamera-vid to stdout → file.
-    Log frame events with seq and byte offsets.
+    Record H.264 directly to file using libcamera-vid and save per-frame PTS to a sidecar file.
+    We tail the PTS file and emit one event per frame with original PTS.
     """
-    w, h = cfg.get("width", 1280), cfg.get("height", 720)
-    frame_bytes = int(w*h*1.5)
+    # libcamera-vid writes file itself, so we start it and separately tail the PTS file for frame timing.
     cmd = [
         "libcamera-vid",
         "-t","0",
-        "--codec","yuv420",
-        "--nopreview",
-        "-o","-",               # stdout
+        "--codec","h264",
+        "--inline",
+        "--profile","baseline",
+        "--level","4.1",
         "--width", str(w),
-        "--height", str(h)
+        "--height", str(h),
+        "--framerate", str(fps),
+        "-o", str(out_h264),
+        "--save-pts", str(pts_path)
     ]
-    proc = await asyncio.create_subprocess_exec(
-        *cmd, stdout=asyncio.subprocess.PIPE
-    )
-    seq, file_bytes = 0, 0
-    buf = b""
-    with open(raw_path, "ab", buffering=0) as vid_out:
-        try:
-            while True:
-                need = frame_bytes - len(buf)
-                chunk = await proc.stdout.read(need if need > 0 else frame_bytes)
-                if not chunk:
-                    break
-                buf += chunk
-                if len(buf) >= frame_bytes:
-                    ts = now_mono()
-                    frame = buf[:frame_bytes]
-                    vid_out.write(frame)
-                    file_bytes += frame_bytes
-                    await queue.put({
-                        "ts_mono_ns": ts,
-                        "ts_wall_ns": wall_from_mono(ts),
-                        "source": "camera",
-                        "seq": seq,
-                        "meta": {"w": w, "h": h, "fmt": "yuv420", "frame_bytes": frame_bytes},
-                        "payload": {"file_bytes_total": file_bytes}
-                    })
-                    buf = buf[frame_bytes:]
-                    seq += 1
-        finally:
-            with contextlib.suppress(ProcessLookupError):
-                proc.terminate()
+    proc = await asyncio.create_subprocess_exec(*cmd)
+    # Tail the PTS file for frame events. Format is one timestamp per line (usually microseconds).
+    # We'll use `tail -F` for robustness across file rotations (libcamera-vid appends).
+    # Wait until PTS file exists:
+    while not pts_path.exists():
+        await asyncio.sleep(0.05)
+    tail = await asyncio.create_subprocess_exec("tail","-F",str(pts_path),
+                                                stdout=asyncio.subprocess.PIPE,
+                                                stderr=asyncio.subprocess.DEVNULL,
+                                                text=True)
+    seq = 0
+    try:
+        while True:
+            line = await tail.stdout.readline()
+            if not line:
+                break
+            line = line.strip()
+            # Typically PTS is in microseconds; accept integers only
+            if not re.fullmatch(r"\d+", line):
+                continue
+            pts_us = int(line)
+            ts = now_mono()
+            await queue.put({
+                "ts_mono_ns": ts,
+                "ts_wall_ns": wall_from_mono(ts),
+                "source": "camera",
+                "seq": seq,
+                "meta": {"fmt":"h264","w":w,"h":h,"fps":fps,"pts_units":"us"},
+                "payload": {"pts_us": pts_us}
+            })
+            seq += 1
+    except asyncio.CancelledError:
+        pass
+    finally:
+        with contextlib.suppress(ProcessLookupError):
+            tail.terminate()
+        with contextlib.suppress(Exception):
+            await tail.wait()
+        with contextlib.suppress(ProcessLookupError):
+            proc.terminate()
+        with contextlib.suppress(Exception):
             await proc.wait()
 
-async def run_pir_pyd1588(queue, *,
-                          gpiochip: str = "/dev/gpiochip0",
-                          dl: int = 17,
-                          serin: int = 27,
-                          cfg: dict | None = None,
-                          include_raw_adc: bool = False):
+async def run_pir_pyd1588(queue: asyncio.Queue, *, gpiochip="/dev/gpiochip0", dl=23, serin=17,
+                          cfg=None, include_raw_adc=False):
     """
-    Uses your PYD1588 driver exactly as implemented:
-      - set lines, write config via SERIN
-      - arm wake-up on DL
-      - wait_for_motion() with short timeouts so we can be cancellable
-      - clear_interrupt() after each fire
-      - optionally do a best-effort forced 40-bit raw read to get ADC amplitude
+    Adapter for your PYD1588 driver. If you don't want this, you can swap back to a gpiod edge reader.
     """
+    try:
+        from pir_pyd1588 import PYD1588, make_config
+    except Exception as e:
+        # Fallback: simple gpiod edge reader if your module isn't available
+        chip = gpiod.Chip(gpiochip); line = chip.get_line(dl)
+        line.request(consumer="pir", type=gpiod.LINE_REQ_EV_BOTH_EDGES)
+        seq = 0
+        try:
+            while True:
+                if not line.event_wait(sec=10):
+                    continue
+                e = line.event_read()
+                edge = "rising" if e.type == gpiod.LineEvent.RISING_EDGE else "falling"
+                ts = now_mono()
+                await queue.put({
+                    "ts_mono_ns": ts,
+                    "ts_wall_ns": wall_from_mono(ts),
+                    "source": "pir",
+                    "seq": seq,
+                    "meta": {"edge": edge, "line": dl, "chip": gpiochip, "driver":"gpiod"},
+                    "payload": {}
+                })
+                seq += 1
+        finally:
+            with contextlib.suppress(Exception): line.release()
+            with contextlib.suppress(Exception): chip.close()
+        return
+
+    # Use your driver
     sensor = PYD1588()
     sensor.gpiochip = gpiochip
     sensor.dl = dl
     sensor.serin = serin
-
-    # Default config close to your prior examples; adjust as you like
-    # threshold, blind, pulses, wtime, opmode=2 (Wake-Up), countmode, source=0(BPF)
     cfg = cfg or dict(threshold=20, blind=3, pulses=1, wtime=1, opmode=2, countmode=0, source=0)
-
-    # Push SERIN config and arm wake-up on DL
     sensor.write_config(make_config(**cfg))
     sensor.arm_wakeup()
 
@@ -190,51 +191,31 @@ async def run_pir_pyd1588(queue, *,
     loop = asyncio.get_running_loop()
     try:
         while True:
-            # Run blocking call in a thread so asyncio remains responsive
             fired = await loop.run_in_executor(None, sensor.wait_for_motion, 1.0)
             if not fired:
                 continue
-
             ts = now_mono()
             payload = {}
             if include_raw_adc:
-                try:
+                with contextlib.suppress(Exception):
                     oor, adc, cfg_mirror = sensor.forced_read_packet()
                     payload.update({"adc": int(adc), "oor": bool(oor), "cfg_mirror": int(cfg_mirror)})
-                except Exception as e:
-                    # Raw read is best-effort; don't break the pipeline
-                    payload.update({"adc_read_error": str(e)})
-
             await queue.put({
                 "ts_mono_ns": ts,
                 "ts_wall_ns": wall_from_mono(ts),
                 "source": "pir",
                 "seq": seq,
-                "meta": {
-                    "edge": "rising",             # DL rising woke us up
-                    "chip": gpiochip,
-                    "line": dl,
-                    "serin": serin,
-                    "driver": "PYD1588",
-                    "config": cfg
-                },
+                "meta": {"edge": "rising", "chip": gpiochip, "line": dl, "serin": serin, "driver":"PYD1588", "config": cfg},
                 "payload": payload
             })
             seq += 1
-
-            # Acknowledge event on the sensor and re-arm
             sensor.clear_interrupt()
     except asyncio.CancelledError:
         pass
     finally:
-        sensor.close()
+        with contextlib.suppress(Exception): sensor.close()
 
-
-async def run_csi_placeholder(queue: asyncio.Queue, cfg: dict):
-    """
-    Placeholder for FeitCSI: emit a heartbeat so the pipeline is wired.
-    Replace with a subprocess reader similar to audio/camera when you’re ready.
-    """
+async def run_csi_placeholder(queue: asyncio.Queue):
     seq = 0
     try:
         while True:
@@ -252,8 +233,7 @@ async def run_csi_placeholder(queue: asyncio.Queue, cfg: dict):
     except asyncio.CancelledError:
         pass
 
-# ========= Log sink (single writer) =========
-
+# ========= Single log sink =========
 async def event_writer(queue: asyncio.Queue, jsonl_path: Path):
     writer = JsonlWriter(jsonl_path)
     try:
@@ -265,81 +245,89 @@ async def event_writer(queue: asyncio.Queue, jsonl_path: Path):
     finally:
         writer.close()
 
-# ========= Main orchestration =========
-
-import contextlib
-
+# ========= Main =========
 async def main():
-    session_root = make_session_root("dataset")
-    # Configs (tweak as needed)
-    audio_cfg = {"device": "hw:1,0", "rate": 48000, "chunk_ms": 100}
-    video_cfg = {"width": 1280, "height": 720}
-    pir_cfg = {"chip": "/dev/gpiochip4", "line": 23}
-    csi_cfg = {}
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--root", default="dataset", help="Dataset root folder")
+    parser.add_argument("--duration", type=float, default=None, help="Seconds to record (default: until Ctrl+C)")
+    parser.add_argument("--video-width", type=int, default=1280)
+    parser.add_argument("--video-height", type=int, default=720)
+    parser.add_argument("--video-fps", type=int, default=30)
+    parser.add_argument("--audio-device", default="plughw:2,0")
+    parser.add_argument("--audio-rate", type=int, default=48000)
+    parser.add_argument("--audio-chunk-ms", type=int, default=100)
+    parser.add_argument("--pir-chip", default="/dev/gpiochip0")
+    parser.add_argument("--pir-dl", type=int, default=23)
+    parser.add_argument("--pir-serin", type=int, default=17)
+    parser.add_argument("--pir-raw-adc", action="store_true")
+    args = parser.parse_args()
 
-    # Files
+    session_root = make_session_root(args.root)
     events_jsonl = session_root / "events.jsonl"
-    video_raw = session_root / "video.yuv"
-    audio_raw = session_root / "audio.raw"
-    audio_sidecar = session_root / "audio.json"
-    meta_path = session_root / "session_meta.json"
+    video_h264 = session_root / "video.h264"
+    video_pts  = session_root / "video.pts"
+    audio_wav  = session_root / "audio.wav"
 
-    # Session metadata
-    meta = SessionMeta(
-        session_id=session_root.name,
-        created_wall_ns=time.time_ns(),
-        created_iso=time.strftime("%Y-%m-%dT%H:%M:%S%z", time.localtime()),
-        host=socket.gethostname(),
-        platform=platform.platform(),
-        kernel=platform.release(),
-        tz=time.tzname[0] if time.tzname else "unknown",
-        clock_offset_ns=offset_ns,
-        video={"fmt": "yuv420", **video_cfg},
-        audio={"fmt": "S32_LE", **audio_cfg},
-        pir=pir_cfg,
-        csi={"enabled": False, **csi_cfg},
-    )
-    (session_root / ".in_progress").write_text("1")
+    # Session meta
+    meta = {
+        "session_id": session_root.name,
+        "created_wall_ns": time.time_ns(),
+        "created_iso": time.strftime("%Y-%m-%dT%H:%M:%S%z", time.localtime()),
+        "host": socket.gethostname(),
+        "platform": platform.platform(),
+        "kernel": platform.release(),
+        "tz": (time.tzname[0] if time.tzname else "unknown"),
+        "clock_offset_ns": offset_ns,
+        "video": {"fmt":"h264","path": video_h264.name, "pts_file": video_pts.name,
+                  "w": args.video_width, "h": args.video_height, "fps": args.video_fps, "inline": True},
+        "audio": {"fmt":"wav","path": audio_wav.name, "rate": args.audio_rate, "pcm_fmt":"S16_LE","device": args.audio_device},
+        "pir": {"chip": args.pir_chip, "dl": args.pir_dl, "serin": args.pir_serin},
+        "csi": {"enabled": False}
+    }
+    (session_root / "session_meta.json").write_text(json.dumps(meta, indent=2))
     (session_root / "README.txt").write_text(
         "This folder is a single recording session.\n"
-        "events.jsonl: newline-delimited JSON event log with ts_mono_ns + ts_wall_ns\n"
-        "video.yuv: raw YUV420 frames, size per frame = width*height*1.5 bytes\n"
-        "audio.raw: S32_LE mono 48kHz\n"
+        "- video.h264 : H.264 elementary stream (inline SPS/PPS). Use ffmpeg to remux to MP4/MKV without re-encode.\n"
+        "- video.pts  : per-frame timestamps (usually microseconds) emitted by libcamera-vid --save-pts.\n"
+        "- audio.wav  : 1-channel PCM S16_LE at configured rate.\n"
+        "- events.jsonl : newline-delimited events with ts_mono_ns + ts_wall_ns for all modalities.\n"
     )
-    (session_root / "session_meta.json").write_text(json.dumps(asdict(meta), indent=2))
-    audio_sidecar.write_text(json.dumps({"path": "audio.raw", **audio_cfg, "fmt": "S32_LE"}, indent=2))
+    (session_root / ".in_progress").write_text("1")
 
     q = asyncio.Queue(maxsize=2000)
-
     tasks = [
         asyncio.create_task(event_writer(q, events_jsonl)),
-        asyncio.create_task(run_camera(q, video_raw, video_cfg)),
-        asyncio.create_task(run_audio(q, audio_raw, audio_cfg)),
-        asyncio.create_task(run_pir_pyd1588(
-            q,
-            gpiochip="/dev/gpiochip0",
-            dl=23,          # <- your DL line
-            serin=17,       # <- your SERIN (MOSI) line
-            cfg=dict(threshold=20, blind=3, pulses=1, wtime=1, opmode=2, countmode=0, source=0),
-            include_raw_adc=True   # set False if you don’t want the extra read
+        asyncio.create_task(run_camera_h264_with_pts(
+            q, video_h264, video_pts,
+            w=args.video_width, h=args.video_height, fps=args.video_fps
         )),
-        asyncio.create_task(run_csi_placeholder(q, csi_cfg)),
+        asyncio.create_task(run_audio_wav(
+            q, audio_wav, device=args.audio_device, rate=args.audio_rate, chunk_ms=args.audio_chunk_ms
+        )),
+        asyncio.create_task(run_pir_pyd1588(
+            q, gpiochip=args.pir_chip, dl=args.pir_dl, serin=args.pir_serin, include_raw_adc=args.pir_raw_adc
+        )),
+        asyncio.create_task(run_csi_placeholder(q)),
     ]
 
-    # Graceful shutdown
-    loop = asyncio.get_running_loop()
+    # graceful shutdown
     stop = asyncio.Event()
-
+    loop = asyncio.get_running_loop()
     def _cancel_all():
-        for t in tasks:
-            t.cancel()
+        for t in tasks: t.cancel()
         stop.set()
-
     for sig in (signal.SIGINT, signal.SIGTERM):
         with contextlib.suppress(NotImplementedError):
             loop.add_signal_handler(sig, _cancel_all)
 
     try:
+        if args.duration is not None:
+            try:
+                await asyncio.wait_for(asyncio.Event().wait(), timeout=args.duration)
+            except asyncio.TimeoutError:
+                pass
+            finally:
+                _cancel_all()
         await stop.wait()
     finally:
         await asyncio.gather(*tasks, return_exceptions=True)
