@@ -349,10 +349,14 @@ async def run_pir_diag_txt(txt_path: Path, *, gpiochip="/dev/gpiochip0", dl=23, 
     sensor.gpiochip = gpiochip
     sensor.dl = dl
     sensor.serin = serin
-    cfg = dict(threshold=20, blind=3, pulses=1, wtime=1, opmode=2, countmode=0, source=0)
+    cfg = make_config(
+        threshold=10, blind=0, pulses=0, wtime=2,
+        opmode=0,   # forced readout
+        countmode=0, source=0  # BPF => signed ADC
+    )
 
     try:
-        sensor.write_config(make_config(**cfg))
+        sensor.write_config(cfg)
     except Exception as e:
         with open(txt_path, "a", buffering=1) as f:
             f.write(f"# PIR diag init failed: {e}\n")
