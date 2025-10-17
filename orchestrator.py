@@ -494,10 +494,10 @@ async def main():
         asyncio.create_task(run_audio_wav(
             q, audio_wav, device=args.audio_device, rate=args.audio_rate, chunk_ms=args.audio_chunk_ms
         )),
-        asyncio.create_task(run_pir_motion(
-            q, gpiochip=args.pir_chip, dl=args.pir_dl, serin=args.pir_serin,
-            include_raw_adc=True, heartbeat_sec=2.0
-        )),
+        # asyncio.create_task(run_pir_motion(
+        #     q, gpiochip=args.pir_chip, dl=args.pir_dl, serin=args.pir_serin,
+        #     include_raw_adc=True, heartbeat_sec=2.0
+        # )),
         asyncio.create_task(run_pir_diag_txt(
             pir_diag, gpiochip=args.pir_chip, dl=args.pir_dl, serin=args.pir_serin,
             sample_hz=args.pir_sample_hz
