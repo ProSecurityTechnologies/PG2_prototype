@@ -56,10 +56,10 @@ async def run_audio(queue: asyncio.Queue, raw_path: Path, fmt: dict):
     """
     cmd = [
         "arecord",
-        "-D", fmt.get("device", "hw:1,0"),
+        "-D", fmt.get("device", "hw:2,0"),
         "-c", "1",
-        "-r", str(fmt.get("rate", 48000)),
-        "-f", "S32_LE",
+        "-r", str(fmt.get("rate", 16000)),
+        "-f", "S16_LE",
         "-q",
         "-t", "raw",
         "-"
